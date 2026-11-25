@@ -1,0 +1,105 @@
+name: Validar camadas no Windows x64
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/validar-windows.yml']
+permissions:
+  contents: read
+jobs:
+  catalogo:
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - name: Baixar e abrir o executável público
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:RUNNER_TEMP 'GeodadosPublicado.exe'
+          Invoke-WebRequest 'https://github.com/lsodias73-crypto/geodados-inde-shapefile/releases/download/v1.0.0/Geodados.INDE.Windows.x64.exe' -OutFile $exe
+          if ((Get-FileHash $exe).Hash.ToLowerInvariant() -ne '0f3cff1353a18a4da5a3036df2419cbe3b7425fcd08667eb8a0b80fc48358981') { throw 'SHA-256 inesperado' }
+          $launcher = Start-Process $exe -PassThru
+          $deadline = (Get-Date).AddSeconds(120)
+          do {
+            Start-Sleep -Seconds 2
+            $child = Get-CimInstance Win32_Process -Filter "ParentProcessId = $($launcher.Id) AND Name = 'Geodados INDE.exe'" | Select-Object -First 1
+            $window = if ($child) { Get-Process -Id $child.ProcessId -ErrorAction SilentlyContinue }
+            if ($window -and $window.MainWindowTitle -eq 'Geodados INDE') { break }
+            if ($launcher.HasExited) { throw "O launcher encerrou com código $($launcher.ExitCode)" }
+          } until ((Get-Date) -gt $deadline)
+          if (!$window -or $window.MainWindowTitle -ne 'Geodados INDE') { throw 'A janela do executável publicado não abriu' }
+          Write-Host 'O executável publicado abriu a janela Geodados INDE.'
+          "GEODADOS_EXE=$($child.ExecutablePath)" >> $env:GITHUB_ENV
+          "GEODADOS_PID=$($child.ProcessId)" >> $env:GITHUB_ENV
+      - name: Verificar camadas na interface Electron
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --no-audit --no-fund --no-save playwright@1.56.1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          @'
+          const { _electron } = require('playwright');
+          const assert = require('node:assert/strict');
+          const { appendFileSync } = require('node:fs');
+          const path = require('node:path');
+          const baseline = new Set(['IBGE','CPRM','ANATEL','ANP','Censipam','FUNAI','FUNAI/CMR','IBAMA','IBGE/ODS','ICA','IDE-GEOBASES (ES)','IDE-SP','IDE/Sisema (MG)','IEDE/FJP (MG)','INPE','IPHAN','IPLANFOR (CE)','MB/DHN','MDR/SEDEC','MS/IDE-MS','Prefeitura de Angra dos Reis (RJ)','Prefeitura de Belo Horizonte (MG)','Prefeitura Municipal de Santo André','PRODEMG (MG)','SEFIN','SEMA (CE)','SFB']);
+          const key = name => name.split(/ - | — /)[0].trim().replace(/\s+/g, ' ');
+          async function shard(worker, stride) {
+            const app = await _electron.launch({
+              executablePath: process.env.GEODADOS_EXE,
+              args: ['--user-data-dir=' + path.join(process.env.RUNNER_TEMP, 'inde-auditoria-' + worker)],
+              timeout: 60_000
+            });
+            try {
+              const page = await app.firstWindow();
+              await page.locator('#services button').first().waitFor({ timeout: 100_000 });
+              const rows = page.locator('#services button');
+              const services = await rows.evaluateAll(buttons => buttons.map(button => {
+                const span = button.querySelector('span');
+                return { name: span.firstChild.textContent, host: span.querySelector('small').textContent };
+              }));
+              assert.ok(services.length > 1, 'O catálogo exibiu somente a entrada fixa da Embrapa');
+              const observations = [];
+              for (let i = worker; i < services.length; i += stride) {
+                await rows.nth(i).click();
+                await page.waitForFunction(() => !document.querySelector('#reload').disabled, undefined, { timeout: 60_000 });
+                const status = await page.locator('#layer-status').innerText();
+                const count = await page.locator('#layers label').count();
+                if (count) assert.ok(status.startsWith(count + ' de ' + count + ' camadas'), status);
+                const item = { index: i, ...services[i], count, status };
+                observations.push(item);
+                console.log(JSON.stringify(item));
+              }
+              return { services, observations };
+            } finally {
+              await app.close();
+            }
+          }
+          async function main() {
+            const results = await Promise.all(Array.from({ length: 4 }, (_, i) => shard(i, 4)));
+            for (const item of results) assert.deepEqual(item.services, results[0].services);
+            const rows = results.flatMap(result => result.observations).sort((a, b) => a.index - b.index);
+            assert.equal(rows.length, results[0].services.length);
+            const active = rows.filter(item => item.count > 0);
+            const current = new Set(active.map(item => key(item.name)));
+            const onlyMac = [...baseline].filter(name => !current.has(name));
+            const onlyWindows = [...current].filter(name => !baseline.has(name));
+            const safe = value => String(value).replace(/\|/g, '/').replace(/[\r\n]/g, ' ');
+            const summary = [
+              '## Geodados INDE no Windows x64',
+              '',
+              `- Catálogo: ${rows.length} serviços. Com camadas: ${active.length}. Sem listagem: ${rows.length - active.length}.`,
+              `- Presentes somente na medição anterior do Mac: ${onlyMac.join(', ') || 'nenhum'}.`,
+              `- Presentes somente nesta medição do Windows: ${onlyWindows.join(', ') || 'nenhum'}.`,
+              '',
+              '| Serviço | Host | Camadas | Resultado da interface |',
+              '|---|---|---:|---|',
+              ...rows.map(item => `| ${safe(item.name)} | ${safe(item.host)} | ${item.count} | ${safe(item.status)} |`)
+            ].join('\n');
+            appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary + '\n');
+            console.log(summary);
+          }
+          main().catch(error => { console.error(error); process.exit(1); });
+          '@ | Set-Content -Encoding utf8 audit.cjs
+          node audit.cjs
+          exit $LASTEXITCODE
